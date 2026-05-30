@@ -81,7 +81,10 @@ public class ParallelDownloader: NSObject {
     var responseBody: String? = nil
     var responseHeaders: [AnyHashable : Any]? = nil
     var initialResponseStatusCode: Int? = nil
-    
+    /// shreyanshp fork: true while stitchChunks() runs on a background queue,
+    /// so a late/duplicate chunk status update can't start a second stitch.
+    var isStitching = false
+
     /// Create a new ParallelDownloader
     init(task:Task) {
         self.parentTask = task
@@ -219,11 +222,28 @@ public class ParallelDownloader: NSObject {
                     case .running:
                         processStatusUpdate(task: parentTask, status: .running)
                     case .complete:
-                        let stitchResult = stitchChunks()
-                        if stitchResult == TaskStatus.complete {
-                            os_log("Finished task with id %@", log: log, type: .info, parentTask.taskId)
+                        // shreyanshp fork: stitching a multi-GB file is heavy
+                        // synchronous file I/O. BDPlugin.handle wraps this whole
+                        // call in `Task { @MainActor }`, so running stitchChunks()
+                        // inline froze the UI 15-30 s on large models (Sentry
+                        // 7477896343 stitch loop / 7483040406 methodUpdateChunkStatus).
+                        // Run it off the main thread, then hop back to post the
+                        // final status. stitchChunks()/finishTask() carry no
+                        // @MainActor isolation, and finishTask/processStatusUpdate
+                        // guard all shared BDPlugin state under propertyLock, so
+                        // this is race-free. `isStitching` blocks a re-entrant stitch.
+                        if !isStitching {
+                            isStitching = true
+                            DispatchQueue.global(qos: .utility).async { [self] in
+                                let stitchResult = stitchChunks()
+                                if stitchResult == TaskStatus.complete {
+                                    os_log("Finished task with id %@", log: log, type: .info, parentTask.taskId)
+                                }
+                                DispatchQueue.main.async { [self] in
+                                    finishTask(status: stitchResult)
+                                }
+                            }
                         }
-                        finishTask(status: stitchResult)
                     case .failed:
                         self.taskException = taskException
                         cancelAllChunkTasks()
