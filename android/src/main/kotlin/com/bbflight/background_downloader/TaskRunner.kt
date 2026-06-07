@@ -818,10 +818,15 @@ open class TaskRunner(
         lastProgressUpdateTime = now
         val bytesSinceLastUpdate = bytesTotal - bytesTotalAtLastProgressUpdate
         bytesTotalAtLastProgressUpdate = bytesTotal
-        val currentNetworkSpeed: Double = if (timeSinceLastUpdate > 3600000)
-            -1.0 else bytesSinceLastUpdate / (timeSinceLastUpdate * 1000.0)
+        // timeSinceLastUpdate <= 0 (two updates in the same millisecond) would
+        // make the divide NaN (0/0) or Infinity, which later throws
+        // "Cannot round NaN value" in Notifications.kt. MOBILE-NEWS-GM.
+        val currentNetworkSpeed: Double =
+            if (timeSinceLastUpdate > 3600000 || timeSinceLastUpdate <= 0) -1.0
+            else bytesSinceLastUpdate / (timeSinceLastUpdate * 1000.0)
         networkSpeed =
-            if (networkSpeed == -1.0) currentNetworkSpeed else (networkSpeed * 3.0 + currentNetworkSpeed) / 4.0
+            if (networkSpeed == -1.0 || networkSpeed.isNaN() || networkSpeed.isInfinite()) currentNetworkSpeed
+            else (networkSpeed * 3.0 + currentNetworkSpeed) / 4.0
         val remainingBytes = (1 - progress) * expectedFileSize
         val timeRemaining: Long =
             if (networkSpeed == -1.0) -1000 else (remainingBytes / networkSpeed / 1000).toLong()

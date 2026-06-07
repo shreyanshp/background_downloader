@@ -1024,8 +1024,11 @@ object NotificationService {
             else ""
         val output2 = progressRegEx.replace(output, progressString)
         // download speed
+        // NaN/Infinity are neither <= 0.0 nor > 1, so without this guard they
+        // fall through to roundToInt() and throw "Cannot round NaN value".
+        // MOBILE-NEWS-GM.
         val networkSpeedString =
-            if (networkSpeed <= 0.0) "-- MB/s" else if (networkSpeed > 1) "${networkSpeed.roundToInt()} MB/s" else "${(networkSpeed * 1000).roundToInt()} kB/s"
+            if (networkSpeed.isNaN() || networkSpeed.isInfinite() || networkSpeed <= 0.0) "-- MB/s" else if (networkSpeed > 1) "${networkSpeed.roundToInt()} MB/s" else "${(networkSpeed * 1000).roundToInt()} kB/s"
         val output3 = networkSpeedRegEx.replace(output2, networkSpeedString)
         // time remaining
         var output4 = output3
