@@ -129,7 +129,21 @@ abstract base class BaseDownloader {
     };
     instance._storage = persistentStorage;
     instance.database = database;
-    unawaited(instance.initialize());
+    // `unawaited` does not attach an error handler - it only silences the
+    // lint - so a failure in here used to escape to the zone error handler and
+    // take the whole app down at startup (e.g. a Windows ERROR_LOCK_VIOLATION
+    // reading the localstore database). A downloader that cannot open its
+    // database must degrade, not crash the host app.
+    unawaited(
+      instance.initialize().catchError((Object e) {
+        instance.log.severe('Could not initialize downloader: $e');
+        if (!instance._readyCompleter.isCompleted) {
+          // Unblock `await ready`, which every database operation sits behind -
+          // callers would otherwise hang forever instead of failing.
+          instance._readyCompleter.complete(false);
+        }
+      }),
+    );
     return instance;
   }
 

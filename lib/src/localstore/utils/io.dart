@@ -17,6 +17,14 @@ final class Utils implements UtilsImpl {
   static final lastPathComponentRegEx = RegExp(r'[^/\\]+[/\\]?$');
 
   static Utils get instance => _utils;
+
+  /// Backoff before read attempt N (0-based); its length sets how many times
+  /// a read is retried before the lock error is rethrown. See [_readBytes].
+  static const _readBackoff = [
+    Duration(milliseconds: 15),
+    Duration(milliseconds: 30),
+    Duration(milliseconds: 60),
+  ];
   final _storageCache = <String, StreamController<Map<String, dynamic>>>{};
   final _fileCache = <String, File>{};
   final _locks = <String, Future<void>>{};
@@ -100,6 +108,13 @@ final class Utils implements UtilsImpl {
           }
         } on PathNotFoundException {
           // return null if not found
+        } on PathAccessException catch (e) {
+          // The OS refused access - on Windows a write holding the range
+          // (ERROR_LOCK_VIOLATION, errno 33), which [_readBytes] has already
+          // retried. Report it as "no document yet" rather than let a
+          // transient lock escape: every caller already handles null, and an
+          // escaping error here reaches the zone handler and is fatal.
+          _log.warning('Could not read $path: $e');
         }
         return null;
       });
@@ -211,16 +226,39 @@ final class Utils implements UtilsImpl {
   }
 
   Future<dynamic> _readFile(RandomAccessFile file) async {
-    final length = await file.length();
-    await file.setPosition(0);
-    final buffer = Uint8List(length);
-    await file.readInto(buffer);
+    final buffer = await _readBytes(file);
     try {
       final contentText = utf8.decode(buffer);
       final data = json.decode(contentText) as Map<String, dynamic>;
       return data;
     } catch (e) {
       return e;
+    }
+  }
+
+  /// Reads every byte of [file], retrying while the OS reports the range is
+  /// locked.
+  ///
+  /// On Windows a read that overlaps [_writeFile]'s exclusive lock fails with
+  /// ERROR_LOCK_VIOLATION (errno 33). That lock is held for microseconds, so
+  /// the loser of the race only has to come back a moment later. A file that
+  /// is genuinely absent is not a race and is rethrown immediately, as is a
+  /// lock that outlives every attempt - the caller decides what that means.
+  Future<Uint8List> _readBytes(RandomAccessFile file) async {
+    for (var attempt = 0;; attempt++) {
+      try {
+        final length = await file.length();
+        await file.setPosition(0);
+        final buffer = Uint8List(length);
+        await file.readInto(buffer);
+        return buffer;
+      } on PathNotFoundException {
+        rethrow;
+      } on FileSystemException catch (e) {
+        if (attempt >= _readBackoff.length) rethrow;
+        _log.finest('Retrying locked read (attempt ${attempt + 1}): $e');
+        await Future<void>.delayed(_readBackoff[attempt]);
+      }
     }
   }
 
@@ -243,17 +281,32 @@ final class Utils implements UtilsImpl {
       final file = await _getFile(path);
       try {
         final randomAccessFile = await file!.open(mode: FileMode.append);
+        var locked = false;
         try {
           await randomAccessFile.lock();
+          locked = true;
           await randomAccessFile.setPosition(0);
           await randomAccessFile.writeFrom(buffer);
           await randomAccessFile.truncate(buffer.length);
-          await randomAccessFile.unlock();
         } finally {
+          // Release only a lock we actually took, and release it even when the
+          // write threw - the old code skipped the unlock on any failure.
+          if (locked) {
+            try {
+              await randomAccessFile.unlock();
+            } catch (e) {
+              _log.finest('Could not unlock $path: $e');
+            }
+          }
           await randomAccessFile.close();
         }
       } on PathNotFoundException {
         // ignore if path not found
+      } on FileSystemException catch (e) {
+        // Another handle holds the range, or the file went away mid-write.
+        // Skip this write instead of throwing: the record is rewritten on the
+        // next status update, and an escaping error here is fatal.
+        _log.warning('Could not write $path: $e');
       }
       final key = path.replaceAll(lastPathComponentRegEx, '');
       // ignore: close_sinks
